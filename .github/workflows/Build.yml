@@ -1,0 +1,108 @@
+name: Build toolchain
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf binutils wget xz-utils
+
+      - name: Fetch Termux package index
+        run: |
+          mkdir -p work && cd work
+          curl -sLO https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages
+
+      - name: Download OpenJDK + Gradle + deps
+        run: |
+          cd work
+          fetch() {
+            local pkg=$1
+            local path=$(awk -v p="$pkg" '
+              /^Package: / { name=$2 }
+              /^Filename: / { if (name==p) { print $2; exit } }
+            ' Packages | head -1)
+            if [ -z "$path" ]; then echo "MISSING: $pkg"; return 1; fi
+            echo "Fetching $pkg -> $path"
+            curl -sLO "https://packages.termux.dev/apt/termux-main/$path"
+          }
+
+          # Runtime + Kotlin/Java build stack
+          fetch openjdk-17
+          fetch openjdk-17-x
+          fetch gradle
+          fetch aapt2
+          fetch apksigner
+          fetch d8
+          fetch kotlin
+          fetch bash
+          fetch coreutils
+          fetch findutils
+          fetch grep
+          fetch sed
+          fetch tar
+          fetch gzip
+          fetch xz-utils
+          fetch openssl
+          fetch ca-certificates
+          fetch zlib
+          fetch libandroid-support
+          fetch libiconv
+          fetch ncurses
+          fetch readline
+          fetch libexpat
+          fetch termux-am
+
+          ls -la
+
+      - name: Extract and flatten
+        run: |
+          cd work
+          mkdir -p extracted
+          for deb in *.deb; do
+            ar x "$deb" data.tar.xz 2>/dev/null || ar x "$deb" data.tar.gz 2>/dev/null || continue
+            if [ -f data.tar.xz ]; then tar -xf data.tar.xz -C extracted; rm data.tar.xz; fi
+            if [ -f data.tar.gz ]; then tar -xf data.tar.gz -C extracted; rm data.tar.gz; fi
+          done
+          ls extracted
+
+      - name: Patch RPATH for Android relocatable paths
+        run: |
+          cd work/extracted
+          # Termux binaries hardcode /data/data/com.termux/files/usr
+          # Rewrite to relative paths so CodeForge can run them from anywhere
+          find bin -type f -exec patchelf --set-rpath '$ORIGIN/../lib' {} \; 2>/dev/null || true
+          find lib -name "*.so*" -type f -exec patchelf --set-rpath '$ORIGIN' {} \; 2>/dev/null || true
+
+          # Also patch any Java/JDK subdirectory binaries
+          find . -type f -executable ! -path "./bin/*" \
+            -exec patchelf --set-rpath '$ORIGIN/../lib' {} \; 2>/dev/null || true
+
+      - name: Rewrite Termux prefix references in configs
+        run: |
+          cd work/extracted
+          # Some configs (gradle wrapper scripts, etc.) hardcode the Termux path
+          PREFIX='/data/data/com.termux/files/usr'
+          grep -rl "$PREFIX" . 2>/dev/null | while read f; do
+            sed -i "s|$PREFIX||g" "$f" || true
+          done
+
+      - name: Pack final tarball
+        run: |
+          cd work/extracted
+          tar -cJf ../../toolchain-aarch64.tar.xz .
+          cd ../..
+          ls -lh toolchain-aarch64.tar.xz
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1
+          name: "Toolchain v1"
+          files: toolchain-aarch64.tar.xz
+          token: ${{ secrets.GITHUB_TOKEN }}
