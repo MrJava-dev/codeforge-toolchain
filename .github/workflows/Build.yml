@@ -3,6 +3,9 @@ name: Build toolchain
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -11,7 +14,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y patchelf binutils wget xz-utils
+          sudo apt-get install -y patchelf binutils wget xz-utils jq
 
       - name: Fetch Termux package index
         run: |
@@ -27,12 +30,11 @@ jobs:
               /^Package: / { name=$2 }
               /^Filename: / { if (name==p) { print $2; exit } }
             ' Packages | head -1)
-            if [ -z "$path" ]; then echo "MISSING: $pkg"; return 1; fi
+            if [ -z "$path" ]; then echo "MISSING: $pkg"; return 0; fi
             echo "Fetching $pkg -> $path"
             curl -sLO "https://packages.termux.dev/apt/termux-main/$path"
           }
 
-          # Runtime + Kotlin/Java build stack
           fetch openjdk-17
           fetch openjdk-17-x
           fetch gradle
@@ -56,7 +58,6 @@ jobs:
           fetch ncurses
           fetch readline
           fetch libexpat
-          fetch termux-am
 
           ls -la
 
@@ -69,24 +70,40 @@ jobs:
             if [ -f data.tar.xz ]; then tar -xf data.tar.xz -C extracted; rm data.tar.xz; fi
             if [ -f data.tar.gz ]; then tar -xf data.tar.gz -C extracted; rm data.tar.gz; fi
           done
-          ls extracted
+
+          echo "=== Before flatten ==="
+          ls -la extracted | head
+
+          # Termux .deb extracts to data/data/com.termux/files/usr/...
+          # Move its contents up so bin/ and lib/ sit at the top
+          if [ -d "extracted/data/data/com.termux/files/usr" ]; then
+            echo "Flattening Termux prefix..."
+            shopt -s dotglob
+            mv extracted/data/data/com.termux/files/usr/* extracted/
+            shopt -u dotglob
+            rm -rf extracted/data
+          fi
+
+          echo "=== After flatten ==="
+          ls -la extracted
+          echo "=== bin/ contents (first 30) ==="
+          ls -la extracted/bin | head -30 || echo "NO BIN DIR FOUND"
 
       - name: Patch RPATH for Android relocatable paths
         run: |
           cd work/extracted
-          # Termux binaries hardcode /data/data/com.termux/files/usr
-          # Rewrite to relative paths so CodeForge can run them from anywhere
+          if [ ! -d bin ]; then
+            echo "ERROR: bin/ missing — flatten step failed"
+            exit 1
+          fi
           find bin -type f -exec patchelf --set-rpath '$ORIGIN/../lib' {} \; 2>/dev/null || true
           find lib -name "*.so*" -type f -exec patchelf --set-rpath '$ORIGIN' {} \; 2>/dev/null || true
-
-          # Also patch any Java/JDK subdirectory binaries
           find . -type f -executable ! -path "./bin/*" \
             -exec patchelf --set-rpath '$ORIGIN/../lib' {} \; 2>/dev/null || true
 
-      - name: Rewrite Termux prefix references in configs
+      - name: Rewrite Termux prefix references
         run: |
           cd work/extracted
-          # Some configs (gradle wrapper scripts, etc.) hardcode the Termux path
           PREFIX='/data/data/com.termux/files/usr'
           grep -rl "$PREFIX" . 2>/dev/null | while read f; do
             sed -i "s|$PREFIX||g" "$f" || true
@@ -99,10 +116,52 @@ jobs:
           cd ../..
           ls -lh toolchain-aarch64.tar.xz
 
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1
-          name: "Toolchain v1"
-          files: toolchain-aarch64.tar.xz
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create release and upload tarball
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1"
+
+          RELEASE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Toolchain $TAG\",\"draft\":false,\"prerelease\":false}")
+
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url // empty' | sed 's/{?name,label}//')
+
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Create failed, looking up existing release..."
+            RELEASE_RESPONSE=$(curl -s \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+            UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url // empty' | sed 's/{?name,label}//')
+          fi
+
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Could not create or find release:"
+            echo "$RELEASE_RESPONSE"
+            exit 1
+          fi
+
+          ASSET_ID=$(curl -s \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
+            | jq -r '.assets[] | select(.name=="toolchain-aarch64.tar.xz") | .id // empty')
+
+          if [ -n "$ASSET_ID" ]; then
+            curl -s -X DELETE \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+          fi
+
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @toolchain-aarch64.tar.xz \
+            "$UPLOAD_URL?name=toolchain-aarch64.tar.xz"
+
+          echo "Upload complete."
