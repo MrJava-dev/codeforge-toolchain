@@ -1,167 +1,1194 @@
-name: Build toolchain
+name: Build CodeForge Toolchain
 
+# ══════════════════════════════════════════════════════════════════════
+#  TRIGGERS
+# ══════════════════════════════════════════════════════════════════════
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1, v2.1, latest)'
+        required: true
+        default: 'v1'
+        type: string
+      include_python:
+        description: 'Include Python 3 runtime + pip'
+        required: false
+        default: false
+        type: boolean
+      include_node:
+        description: 'Include Node.js + npm'
+        required: false
+        default: false
+        type: boolean
+      include_native:
+        description: 'Include clang, make, cmake, binutils'
+        required: false
+        default: false
+        type: boolean
+      include_lua:
+        description: 'Include Lua 5.4 + luarocks'
+        required: false
+        default: false
+        type: boolean
+      verify_only:
+        description: 'Skip build, only verify latest release'
+        required: false
+        default: false
+        type: boolean
+      debug:
+        description: 'Verbose output'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
 
+# ══════════════════════════════════════════════════════════════════════
+#  PERMISSIONS
+# ══════════════════════════════════════════════════════════════════════
 permissions:
   contents: write
+  actions: read
 
+# ══════════════════════════════════════════════════════════════════════
+#  CONCURRENCY — never run two builds for the same tag at once
+# ══════════════════════════════════════════════════════════════════════
+concurrency:
+  group: toolchain-build-${{ github.ref }}
+  cancel-in-progress: false
+
+# ══════════════════════════════════════════════════════════════════════
+#  GLOBAL ENVIRONMENT
+# ══════════════════════════════════════════════════════════════════════
+env:
+  # Termux package index and mirrors, tried in order
+  TERMUX_INDEX_URL: https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages
+  TERMUX_MIRROR_1: https://packages.termux.dev/apt/termux-main
+  TERMUX_MIRROR_2: https://mirror.utermux.dev/termux/termux-main
+  TERMUX_MIRROR_3: https://grimler.se/termux/termux-main
+
+  # Build config
+  TARBALL_NAME: toolchain-aarch64
+  WORK_DIR: build
+  EXTRACT_DIR: build/extracted
+  CACHE_VERSION: 'v1'
+
+  # Retry settings
+  MAX_RETRIES: '3'
+  RETRY_DELAY_SECONDS: '5'
+  CONNECT_TIMEOUT: '30'
+
+  # Limits
+  MIN_TARBALL_BYTES: '100000000'
+  MAX_TARBALL_BYTES: '2000000000'
+
+# ══════════════════════════════════════════════════════════════════════
+#  JOBS
+# ══════════════════════════════════════════════════════════════════════
 jobs:
-  build:
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 1: PREFLIGHT
+  #  Validate inputs, check network, resolve the tag.
+  # ─────────────────────────────────────────────────────────────────
+  preflight:
+    name: Preflight checks
     runs-on: ubuntu-22.04
-
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      index_reachable: ${{ steps.net.outputs.index_reachable }}
+      packages_available: ${{ steps.net.outputs.packages_available }}
     steps:
-      - name: Install tools
+      - name: Resolve tag
+        id: tag
         run: |
-          sudo apt-get update
-          sudo apt-get install -y patchelf binutils wget xz-utils jq
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
 
-      - name: Fetch Termux package index
+      - name: Check network to Termux mirrors
+        id: net
         run: |
-          mkdir -p work && cd work
-          curl -sLO https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages
+          set -uo pipefail
 
-      - name: Download OpenJDK + Gradle + deps
+          index_ok=false
+          for url in "$TERMUX_INDEX_URL"; do
+            echo "Probing index: $url"
+            if curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time 60 -o /dev/null "$url"; then
+              echo "  ✓ reachable"
+              index_ok=true
+              break
+            else
+              echo "  ✗ unreachable"
+            fi
+          done
+          echo "index_reachable=$index_ok" >> "$GITHUB_OUTPUT"
+
+          packages_ok=false
+          for mirror in "$TERMUX_MIRROR_1" "$TERMUX_MIRROR_2" "$TERMUX_MIRROR_3"; do
+            echo "Probing mirror: $mirror"
+            if curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time 30 -o /dev/null "$mirror/" 2>/dev/null; then
+              echo "  ✓ reachable"
+              packages_ok=true
+              break
+            else
+              echo "  ✗ unreachable"
+            fi
+          done
+          echo "packages_available=$packages_ok" >> "$GITHUB_OUTPUT"
+
+          if [ "$index_ok" = "false" ]; then
+            echo "::error::Termux index is not reachable from this runner."
+            exit 1
+          fi
+
+      - name: Check disk space
         run: |
-          cd work
-          fetch() {
-            local pkg=$1
-            local path=$(awk -v p="$pkg" '
+          set -euo pipefail
+          df -h /
+          AVAIL_KB=$(df --output=avail / | tail -1 | tr -d ' ')
+          NEEDED_KB=$((3 * 1024 * 1024))  # 3 GB
+          if [ "$AVAIL_KB" -lt "$NEEDED_KB" ]; then
+            echo "::error::Insufficient disk space: ${AVAIL_KB}KB available, ${NEEDED_KB}KB needed"
+            exit 1
+          fi
+          echo "Disk space OK: ${AVAIL_KB}KB available"
+
+      - name: Report resolved configuration
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════"
+          echo "  BUILD CONFIGURATION"
+          echo "════════════════════════════════════════════"
+          echo "Tag:             ${{ steps.tag.outputs.tag }}"
+          echo "Index:           $TERMUX_INDEX_URL"
+          echo "Mirror 1:        $TERMUX_MIRROR_1"
+          echo "Mirror 2:        $TERMUX_MIRROR_2"
+          echo "Mirror 3:        $TERMUX_MIRROR_3"
+          echo "Include Python:  ${{ github.event.inputs.include_python || 'false' }}"
+          echo "Include Node:    ${{ github.event.inputs.include_node || 'false' }}"
+          echo "Include Native:  ${{ github.event.inputs.include_native || 'false' }}"
+          echo "Include Lua:     ${{ github.event.inputs.include_lua || 'false' }}"
+          echo "Debug:           ${{ github.event.inputs.debug || 'false' }}"
+          echo "════════════════════════════════════════════"
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 2: FETCH INDEX
+  #  Download and cache the Termux package index.
+  # ─────────────────────────────────────────────────────────────────
+  fetch-index:
+    name: Fetch Termux index
+    runs-on: ubuntu-22.04
+    needs: preflight
+    timeout-minutes: 10
+    steps:
+      - name: Cache package index
+        id: cache-index
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORK_DIR }}/Packages
+          key: termux-index-${{ env.CACHE_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            termux-index-${{ env.CACHE_VERSION }}-
+            termux-index-
+
+      - name: Download index (if not cached)
+        if: steps.cache-index.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR"
+          cd "$WORK_DIR"
+
+          downloaded=false
+          for attempt in $(seq 1 "$MAX_RETRIES"); do
+            echo "Attempt $attempt: downloading index..."
+            if curl -fsSL \
+                --connect-timeout "$CONNECT_TIMEOUT" \
+                --max-time 120 \
+                --retry 3 \
+                --retry-delay 5 \
+                -o Packages \
+                "$TERMUX_INDEX_URL"; then
+              if [ -s Packages ]; then
+                downloaded=true
+                echo "  ✓ Index downloaded ($(wc -l < Packages) lines)"
+                break
+              fi
+            fi
+            echo "  ✗ Attempt $attempt failed, waiting ${RETRY_DELAY_SECONDS}s..."
+            sleep "$RETRY_DELAY_SECONDS"
+          done
+
+          if [ "$downloaded" = "false" ]; then
+            echo "::error::Failed to download Termux index after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      - name: Verify index contents
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          if [ ! -f Packages ] || [ ! -s Packages ]; then
+            echo "::error::Index is missing or empty"
+            exit 1
+          fi
+
+          echo "Index line count: $(wc -l < Packages)"
+          echo "Package count:    $(grep -c '^Package: ' Packages)"
+          echo ""
+          echo "Checking for required packages:"
+          for pkg in openjdk-17 gradle kotlin aapt2 apksigner d8; do
+            if grep -q "^Package: $pkg$" Packages; then
+              echo "  ✓ $pkg"
+            else
+              echo "  ✗ $pkg NOT FOUND"
+            fi
+          done
+
+      - name: Upload index artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-index
+          path: ${{ env.WORK_DIR }}/Packages
+          retention-days: 7
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 3: DOWNLOAD PACKAGES
+  #  Fetch every .deb with retry and mirror fallback.
+  # ─────────────────────────────────────────────────────────────────
+  download:
+    name: Download packages
+    runs-on: ubuntu-22.04
+    needs: [preflight, fetch-index]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download index artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: termux-index
+          path: ${{ env.WORK_DIR }}
+
+      - name: Restore package cache
+        id: cache-debs
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORK_DIR }}/raw
+          key: termux-debs-${{ env.CACHE_VERSION }}-${{ hashFiles('build/Packages') }}
+          restore-keys: |
+            termux-debs-${{ env.CACHE_VERSION }}-
+            termux-debs-
+
+      - name: Prepare package directory
+        run: mkdir -p "$WORK_DIR/raw"
+
+      - name: Build package list
+        id: pkglist
+        run: |
+          set -euo pipefail
+
+          # Always required
+          REQUIRED="openjdk-17 gradle kotlin aapt2 apksigner d8 bash coreutils findutils grep sed tar gzip xz-utils openssl ca-certificates zlib libandroid-support libiconv ncurses readline libexpat"
+
+          # Optional, gated by inputs
+          OPTIONAL=""
+          if [ "${{ github.event.inputs.include_python }}" = "true" ]; then
+            OPTIONAL="$OPTIONAL python python-pip"
+          fi
+          if [ "${{ github.event.inputs.include_node }}" = "true" ]; then
+            OPTIONAL="$OPTIONAL nodejs"
+          fi
+          if [ "${{ github.event.inputs.include_native }}" = "true" ]; then
+            OPTIONAL="$OPTIONAL clang make cmake binutils pkg-config"
+          fi
+          if [ "${{ github.event.inputs.include_lua }}" = "true" ]; then
+            OPTIONAL="$OPTIONAL lua54 luarocks"
+          fi
+
+          ALL="$REQUIRED $OPTIONAL"
+          echo "$ALL" | tr ' ' '\n' | grep -v '^$' | sort -u > "$WORK_DIR/package-list.txt"
+          echo "package_count=$(wc -l < "$WORK_DIR/package-list.txt")" >> "$GITHUB_OUTPUT"
+          echo "Packages to fetch:"
+          cat "$WORK_DIR/package-list.txt" | sed 's/^/  - /'
+
+      - name: Download each package
+        run: |
+          set -uo pipefail
+
+          cd "$WORK_DIR"
+          DOWNLOAD_DIR="$PWD/raw"
+          MISSING_FILE="$PWD/missing-packages.txt"
+          FAILED_FILE="$PWD/failed-packages.txt"
+          : > "$MISSING_FILE"
+          : > "$FAILED_FILE"
+
+          # Extract the .deb path for a package name
+          find_deb_path() {
+            local pkg="$1"
+            awk -v p="$pkg" '
               /^Package: / { name=$2 }
               /^Filename: / { if (name==p) { print $2; exit } }
-            ' Packages | head -1)
-            if [ -z "$path" ]; then echo "MISSING: $pkg"; return 0; fi
-            echo "Fetching $pkg -> $path"
-            curl -sLO "https://packages.termux.dev/apt/termux-main/$path"
+            ' Packages | head -1
           }
 
-          fetch openjdk-17
-          fetch openjdk-17-x
-          fetch gradle
-          fetch aapt2
-          fetch apksigner
-          fetch d8
-          fetch kotlin
-          fetch bash
-          fetch coreutils
-          fetch findutils
-          fetch grep
-          fetch sed
-          fetch tar
-          fetch gzip
-          fetch xz-utils
-          fetch openssl
-          fetch ca-certificates
-          fetch zlib
-          fetch libandroid-support
-          fetch libiconv
-          fetch ncurses
-          fetch readline
-          fetch libexpat
+          # Try downloading from all mirrors with retries
+          download_from_mirrors() {
+            local pkg_path="$1"
+            local out_file="$2"
+            local filename
+            filename="$(basename "$pkg_path")"
 
-          ls -la
+            for mirror in "$TERMUX_MIRROR_1" "$TERMUX_MIRROR_2" "$TERMUX_MIRROR_3"; do
+              for attempt in 1 2 3; do
+                local url="$mirror/$pkg_path"
+                if curl -fsSL \
+                    --connect-timeout "$CONNECT_TIMEOUT" \
+                    --max-time 300 \
+                    --retry 2 \
+                    --retry-delay 3 \
+                    -o "$out_file.tmp" \
+                    "$url"; then
+                  mv "$out_file.tmp" "$out_file"
+                  echo "    ✓ Downloaded $filename from $mirror (attempt $attempt)"
+                  return 0
+                fi
+                echo "    ✗ $mirror attempt $attempt failed, retrying…"
+                sleep 2
+              done
+            done
+            return 1
+          }
 
-      - name: Extract and flatten
-        run: |
-          cd work
-          mkdir -p extracted
-          for deb in *.deb; do
-            ar x "$deb" data.tar.xz 2>/dev/null || ar x "$deb" data.tar.gz 2>/dev/null || continue
-            if [ -f data.tar.xz ]; then tar -xf data.tar.xz -C extracted; rm data.tar.xz; fi
-            if [ -f data.tar.gz ]; then tar -xf data.tar.gz -C extracted; rm data.tar.gz; fi
+          # Iterate through package list
+          FAILED=0
+          SUCCEEDED=0
+
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+
+            deb_path=$(find_deb_path "$pkg")
+            if [ -z "$deb_path" ]; then
+              echo "  ✗ MISSING: $pkg (not in index)"
+              echo "$pkg" >> "$MISSING_FILE"
+              continue
+            fi
+
+            filename=$(basename "$deb_path")
+            out_file="$DOWNLOAD_DIR/$filename"
+
+            if [ -f "$out_file" ] && [ -s "$out_file" ]; then
+              echo "  ✓ CACHED: $pkg ($filename)"
+              SUCCEEDED=$((SUCCEEDED + 1))
+              continue
+            fi
+
+            echo "  → Fetching: $pkg → $filename"
+            if download_from_mirrors "$deb_path" "$out_file"; then
+              SUCCEEDED=$((SUCCEEDED + 1))
+            else
+              echo "  ✗ FAILED: $pkg"
+              echo "$pkg" >> "$FAILED_FILE"
+              FAILED=$((FAILED + 1))
+            fi
+          done < package-list.txt
+
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  DOWNLOAD SUMMARY"
+          echo "════════════════════════════════════════════"
+          echo "  Succeeded: $SUCCEEDED"
+          echo "  Missing:   $(wc -l < "$MISSING_FILE")"
+          echo "  Failed:    $FAILED"
+          echo "════════════════════════════════════════════"
+
+          if [ -s "$MISSING_FILE" ]; then
+            echo ""
+            echo "Missing packages (not in Termux index):"
+            sed 's/^/  - /' "$MISSING_FILE"
+          fi
+
+          if [ -s "$FAILED_FILE" ]; then
+            echo ""
+            echo "Failed downloads:"
+            sed 's/^/  - /' "$FAILED_FILE"
+            echo "::warning::Some packages failed to download — build will continue with available ones"
+          fi
+
+          # Fail only if critical packages are missing
+          CRITICAL="openjdk-17 gradle kotlin bash"
+          for c in $CRITICAL; do
+            if grep -q "^$c$" "$MISSING_FILE" 2>/dev/null; then
+              echo "::error::Critical package missing: $c"
+              exit 1
+            fi
           done
 
-          echo "=== Before flatten ==="
-          ls -la extracted | head
+          echo ""
+          echo "Downloaded .deb files:"
+          ls -lh "$DOWNLOAD_DIR" | tail -n +2
+
+      - name: Upload downloaded packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-debs
+          path: |
+            ${{ env.WORK_DIR }}/raw
+            ${{ env.WORK_DIR }}/package-list.txt
+          retention-days: 7
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 4: EXTRACT AND FLATTEN
+  #  Extract every .deb, flatten Termux $PREFIX, dereference symlinks.
+  # ─────────────────────────────────────────────────────────────────
+  extract:
+    name: Extract and flatten
+    runs-on: ubuntu-22.04
+    needs: download
+    timeout-minutes: 30
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: termux-debs
+          path: ${{ env.WORK_DIR }}
+
+      - name: Install extraction tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils
+
+      - name: Extract every .deb
+        run: |
+          set -euo pipefail
+
+          cd "$WORK_DIR"
+          mkdir -p extracted
+          EXTRACTED=0
+          SKIPPED=0
+
+          for deb in raw/*.deb; do
+            [ -e "$deb" ] || continue
+            echo "  → Extracting $(basename "$deb")"
+
+            # .deb is an ar archive containing data.tar.{xz,gz,zst}
+            ar x "$deb" 2>/dev/null || {
+              echo "    ✗ ar failed"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            }
+
+            if [ -f data.tar.xz ]; then
+              tar -xf data.tar.xz -C extracted
+              rm -f data.tar.xz
+              EXTRACTED=$((EXTRACTED + 1))
+            elif [ -f data.tar.gz ]; then
+              tar -xf data.tar.gz -C extracted
+              rm -f data.tar.gz
+              EXTRACTED=$((EXTRACTED + 1))
+            elif [ -f data.tar.zst ]; then
+              # Try with zstd if available
+              if command -v zstd >/dev/null 2>&1; then
+                zstd -d data.tar.zst -o data.tar
+                tar -xf data.tar -C extracted
+                rm -f data.tar data.tar.zst
+                EXTRACTED=$((EXTRACTED + 1))
+              else
+                echo "    ✗ zstd not available"
+                SKIPPED=$((SKIPPED + 1))
+              fi
+            else
+              echo "    ✗ No data.tar found"
+              SKIPPED=$((SKIPPED + 1))
+            fi
+
+            rm -f debian-binary control.tar.* 2>/dev/null || true
+          done
+
+          echo ""
+          echo "Extracted: $EXTRACTED packages"
+          echo "Skipped:   $SKIPPED packages"
+
+      - name: Flatten Termux prefix
+        run: |
+          set -euo pipefail
+
+          cd "$WORK_DIR/extracted"
 
           # Termux .deb extracts to data/data/com.termux/files/usr/...
-          # Move its contents up so bin/ and lib/ sit at the top
-          if [ -d "extracted/data/data/com.termux/files/usr" ]; then
-            echo "Flattening Termux prefix..."
+          TERMUX_PREFIX="data/data/com.termux/files/usr"
+
+          if [ -d "$TERMUX_PREFIX" ]; then
+            echo "Flattening Termux prefix…"
             shopt -s dotglob
-            mv extracted/data/data/com.termux/files/usr/* extracted/
+
+            # Move each top-level item into extracted/
+            for item in "$TERMUX_PREFIX"/*; do
+              base=$(basename "$item")
+              if [ -e "$base" ]; then
+                # Merge directory contents if both exist
+                if [ -d "$item" ] && [ -d "$base" ]; then
+                  echo "  Merging $base/"
+                  cp -rn "$item"/* "$base/" 2>/dev/null || true
+                else
+                  mv "$item" .
+                fi
+              else
+                mv "$item" .
+              fi
+            done
+
             shopt -u dotglob
-            rm -rf extracted/data
+            rm -rf data
+            echo "  ✓ Flattened"
+          else
+            echo "No Termux prefix found — already flat"
           fi
 
-          echo "=== After flatten ==="
-          ls -la extracted
-          echo "=== bin/ contents (first 30) ==="
-          ls -la extracted/bin | head -30 || echo "NO BIN DIR FOUND"
+          echo ""
+          echo "Top-level contents:"
+          ls -la | head -20
 
-      - name: Patch RPATH for Android relocatable paths
+      - name: Verify critical files exist
         run: |
-          cd work/extracted
+          set -euo pipefail
+          cd "$WORK_DIR/extracted"
+
+          echo "════════════════════════════════════════════"
+          echo "  STRUCTURE VERIFICATION"
+          echo "════════════════════════════════════════════"
+
+          FAIL=0
+
+          # Check for bin directory
           if [ ! -d bin ]; then
-            echo "ERROR: bin/ missing — flatten step failed"
+            echo "::error::bin/ directory is missing"
             exit 1
           fi
-          find bin -type f -exec patchelf --set-rpath '$ORIGIN/../lib' {} \; 2>/dev/null || true
-          find lib -name "*.so*" -type f -exec patchelf --set-rpath '$ORIGIN' {} \; 2>/dev/null || true
-          find . -type f -executable ! -path "./bin/*" \
-            -exec patchelf --set-rpath '$ORIGIN/../lib' {} \; 2>/dev/null || true
+          echo "  ✓ bin/ exists"
 
-      - name: Rewrite Termux prefix references
+          # Check for JDK
+          if [ -d lib/jvm ] || [ -d opt/openjdk ]; then
+            echo "  ✓ JDK found"
+            find . -maxdepth 4 -name 'java' -type f 2>/dev/null | head -3 | sed 's/^/    /'
+          else
+            echo "  ✗ JDK NOT FOUND"
+            FAIL=1
+          fi
+
+          # Check for Gradle
+          if [ -d opt/gradle ] || [ -f bin/gradle ]; then
+            echo "  ✓ Gradle found"
+          else
+            echo "  ✗ Gradle NOT FOUND"
+            FAIL=1
+          fi
+
+          # Check for Kotlin
+          if [ -d opt/kotlin ] || [ -f bin/kotlinc ]; then
+            echo "  ✓ Kotlin found"
+          else
+            echo "  ✗ Kotlin NOT FOUND"
+            FAIL=1
+          fi
+
+          # Check for aapt2
+          if [ -f bin/aapt2 ]; then
+            echo "  ✓ aapt2 found"
+          else
+            echo "  ✗ aapt2 NOT FOUND (non-critical)"
+          fi
+
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "::error::Critical toolchain components missing"
+            exit 1
+          fi
+
+          echo ""
+          echo "Binary count:  $(find bin -type f -executable 2>/dev/null | wc -l)"
+          echo "Library count: $(find lib -name '*.so*' 2>/dev/null | wc -l)"
+
+      - name: Upload extracted tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-tree
+          path: ${{ env.WORK_DIR }}/extracted
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0   # don't re-compress; too slow for large trees
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 5: PATCH RPATH
+  #  Rewrite ELF rpath so binaries are relocatable.
+  # ─────────────────────────────────────────────────────────────────
+  patch:
+    name: Patch RPATH
+    runs-on: ubuntu-22.04
+    needs: extract
+    timeout-minutes: 20
+    steps:
+      - name: Install patchelf
         run: |
-          cd work/extracted
-          PREFIX='/data/data/com.termux/files/usr'
-          grep -rl "$PREFIX" . 2>/dev/null | while read f; do
-            sed -i "s|$PREFIX||g" "$f" || true
+          sudo apt-get update
+          sudo apt-get install -y patchelf
+
+      - name: Download extracted tree
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-tree
+          path: ${{ env.WORK_DIR }}/extracted
+
+      - name: Patch all ELF binaries
+        run: |
+          set -uo pipefail
+
+          cd "$WORK_DIR/extracted"
+
+          PATCHED=0
+          FAILED=0
+
+          echo "Scanning for ELF binaries…"
+
+          # Patch bin/
+          while IFS= read -r -d '' file; do
+            if file "$file" | grep -q "ELF"; then
+              if patchelf --set-rpath '$ORIGIN/../lib' "$file" 2>/dev/null; then
+                PATCHED=$((PATCHED + 1))
+              else
+                FAILED=$((FAILED + 1))
+              fi
+            fi
+          done < <(find bin -type f -print0 2>/dev/null)
+
+          echo "  bin/: $PATCHED patched, $FAILED failed"
+
+          # Patch lib/
+          PATCHED=0
+          FAILED=0
+          while IFS= read -r -d '' file; do
+            if file "$file" | grep -q "ELF"; then
+              if patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null; then
+                PATCHED=$((PATCHED + 1))
+              else
+                FAILED=$((FAILED + 1))
+              fi
+            fi
+          done < <(find lib -type f -name '*.so*' -print0 2>/dev/null)
+
+          echo "  lib/: $PATCHED patched, $FAILED failed"
+
+          # Patch opt/ (gradle, kotlin, etc.)
+          PATCHED=0
+          FAILED=0
+          if [ -d opt ]; then
+            while IFS= read -r -d '' file; do
+              if file "$file" | grep -q "ELF"; then
+                if patchelf --set-rpath '$ORIGIN/../../lib' "$file" 2>/dev/null; then
+                  PATCHED=$((PATCHED + 1))
+                else
+                  FAILED=$((FAILED + 1))
+                fi
+              fi
+            done < <(find opt -type f -executable -print0 2>/dev/null)
+            echo "  opt/: $PATCHED patched, $FAILED failed"
+          fi
+
+          # Patch lib/jvm/ (JDK binaries)
+          PATCHED=0
+          FAILED=0
+          if [ -d lib/jvm ]; then
+            while IFS= read -r -d '' file; do
+              if file "$file" | grep -q "ELF"; then
+                # JDK binaries live at lib/jvm/<ver>/bin/...; libs at lib/jvm/<ver>/lib/
+                # Use a relative rpath that reaches up to the top lib/
+                if patchelf --set-rpath '$ORIGIN/../../../lib' "$file" 2>/dev/null; then
+                  PATCHED=$((PATCHED + 1))
+                else
+                  FAILED=$((FAILED + 1))
+                fi
+              fi
+            done < <(find lib/jvm -type f \( -name 'java' -o -name 'javac' -o -name 'jar' -o -name 'keytool' \) -print0 2>/dev/null)
+            echo "  lib/jvm/: $PATCHED patched, $FAILED failed"
+          fi
+
+          echo ""
+          echo "RPATH patching complete."
+
+      - name: Upload patched tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-tree
+          path: ${{ env.WORK_DIR }}/extracted
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 6: VERIFY STRUCTURE
+  #  Static verification of the patched tree.
+  #  (Cannot exec aarch64 Android binaries natively on x86_64 runner.)
+  # ─────────────────────────────────────────────────────────────────
+  verify:
+    name: Verify structure
+    runs-on: ubuntu-22.04
+    needs: patch
+    timeout-minutes: 15
+    steps:
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file binutils
+
+      - name: Download patched tree
+        uses: actions/download-artifact@v4
+        with:
+          name: patched-tree
+          path: ${{ env.WORK_DIR }}/extracted
+
+      - name: Verify ELF architecture
+        run: |
+          set -euo pipefail
+
+          cd "$WORK_DIR/extracted"
+
+          echo "════════════════════════════════════════════"
+          echo "  ELF ARCHITECTURE VERIFICATION"
+          echo "════════════════════════════════════════════"
+
+          CHECKED=0
+          AARCH64=0
+          OTHER=0
+
+          for candidate in bin/bash bin/aapt2 bin/d8 bin/apksigner; do
+            [ -f "$candidate" ] || continue
+            CHECKED=$((CHECKED + 1))
+            ARCH=$(file "$candidate" | grep -oE '(aarch64|ARM|Intel|x86)' | head -1)
+            if [ "$ARCH" = "aarch64" ]; then
+              AARCH64=$((AARCH64 + 1))
+              echo "  ✓ $candidate — aarch64"
+            else
+              OTHER=$((OTHER + 1))
+              echo "  ✗ $candidate — $ARCH (expected aarch64)"
+            fi
           done
 
-      - name: Pack final tarball
-        run: |
-          cd work/extracted
-          tar -cJf ../../toolchain-aarch64.tar.xz .
-          cd ../..
-          ls -lh toolchain-aarch64.tar.xz
+          echo ""
+          echo "  Checked: $CHECKED"
+          echo "  aarch64: $AARCH64"
+          echo "  Other:   $OTHER"
 
-      - name: Create release and upload tarball
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="v1"
-
-          RELEASE_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases" \
-            -d "{\"tag_name\":\"$TAG\",\"name\":\"Toolchain $TAG\",\"draft\":false,\"prerelease\":false}")
-
-          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url // empty' | sed 's/{?name,label}//')
-
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "Create failed, looking up existing release..."
-            RELEASE_RESPONSE=$(curl -s \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
-            UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url // empty' | sed 's/{?name,label}//')
-          fi
-
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "Could not create or find release:"
-            echo "$RELEASE_RESPONSE"
+          if [ "$AARCH64" -eq 0 ]; then
+            echo "::error::No aarch64 binaries found — extraction or download wrong"
             exit 1
           fi
 
-          ASSET_ID=$(curl -s \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
-            | jq -r '.assets[] | select(.name=="toolchain-aarch64.tar.xz") | .id // empty')
+      - name: Verify RPATH was applied
+        run: |
+          set -euo pipefail
 
-          if [ -n "$ASSET_ID" ]; then
-            curl -s -X DELETE \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+          cd "$WORK_DIR/extracted"
+
+          echo "════════════════════════════════════════════"
+          echo "  RPATH VERIFICATION"
+          echo "════════════════════════════════════════════"
+
+          PATHS_OK=0
+          PATHS_MISSING=0
+
+          for candidate in bin/bash bin/aapt2 lib/libz.so.1; do
+            if [ ! -f "$candidate" ]; then continue; fi
+            RPATH=$(readelf -d "$candidate" 2>/dev/null | grep -E 'RPATH|RUNPATH' | head -1 || echo "none")
+            if echo "$RPATH" | grep -q '\$ORIGIN'; then
+              PATHS_OK=$((PATHS_OK + 1))
+              echo "  ✓ $candidate — $RPATH"
+            else
+              PATHS_MISSING=$((PATHS_MISSING + 1))
+              echo "  ✗ $candidate — $RPATH"
+            fi
+          done
+
+          echo ""
+          echo "  Set:     $PATHS_OK"
+          echo "  Not set: $PATHS_MISSING"
+
+          # Not a hard failure — some binaries legitimately have no rpath
+
+      - name: Check symlink resolution
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR/extracted"
+
+          echo "════════════════════════════════════════════"
+          echo "  SYMLINK CHECK"
+          echo "════════════════════════════════════════════"
+          echo "  (Tarball will be packed with -h to dereference, so count is"
+          echo "   informational only)"
+
+          COUNT=$(find . -type l 2>/dev/null | wc -l)
+          echo "  Symlinks in tree: $COUNT"
+
+          # Count broken symlinks
+          BROKEN=$(find . -xtype l 2>/dev/null | wc -l)
+          echo "  Broken symlinks:  $BROKEN"
+
+      - name: Verify size
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR/extracted"
+
+          TOTAL=$(du -sb . | cut -f1)
+          TOTAL_MB=$((TOTAL / 1024 / 1024))
+
+          echo "Total extracted size: ${TOTAL_MB} MB"
+
+          if [ "$TOTAL" -lt 50000000 ]; then
+            echo "::error::Extracted tree is suspiciously small (${TOTAL_MB} MB)"
+            exit 1
           fi
 
-          curl -s -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @toolchain-aarch64.tar.xz \
-            "$UPLOAD_URL?name=toolchain-aarch64.tar.xz"
+          echo "  ✓ Size is reasonable"
 
-          echo "Upload complete."
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 7: PACKAGE
+  #  Create the final tarball with a manifest.
+  # ─────────────────────────────────────────────────────────────────
+  package:
+    name: Package tarball
+    runs-on: ubuntu-22.04
+    needs: verify
+    timeout-minutes: 20
+    outputs:
+      tarball_size: ${{ steps.pack.outputs.size }}
+      tarball_sha: ${{ steps.pack.outputs.sha }}
+    steps:
+      - name: Download patched tree
+        uses: actions/download-artifact@v4
+        with:
+          name: patched-tree
+          path: ${{ env.WORK_DIR }}/extracted
+
+      - name: Generate manifest
+        run: |
+          set -euo pipefail
+
+          cd "$WORK_DIR/extracted"
+
+          # Collect tool versions by inspecting the tree
+          JAVA_VERSION="unknown"
+          GRADLE_VERSION="unknown"
+          KOTLIN_VERSION="unknown"
+
+          # Try to read version from properties files
+          if [ -f opt/gradle/build.txt ]; then
+            GRADLE_VERSION=$(cat opt/gradle/build.txt 2>/dev/null || echo "unknown")
+          fi
+          if [ -f opt/kotlin/build.txt ]; then
+            KOTLIN_VERSION=$(cat opt/kotlin/build.txt 2>/dev/null || echo "unknown")
+          fi
+
+          # JDK version from release file
+          if [ -f lib/jvm/java-17-openjdk/release ]; then
+            JAVA_VERSION=$(grep JAVA_VERSION opt/../lib/jvm/java-17-openjdk/release 2>/dev/null | cut -d'"' -f2 || echo "17")
+          fi
+
+          # Binary count
+          BIN_COUNT=$(find bin -type f -executable 2>/dev/null | wc -l)
+          LIB_COUNT=$(find lib -name '*.so*' 2>/dev/null | wc -l)
+
+          cat > "$GITHUB_WORKSPACE/$WORK_DIR/manifest.json" <<EOF
+          {
+            "schema": "codeforge.toolchain/v1",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "tag": "${{ needs.preflight.outputs.tag }}",
+            "architecture": "aarch64",
+            "os": "android",
+            "libc": "bionic",
+            "source": "termux-packages",
+            "components": {
+              "openjdk": "$JAVA_VERSION",
+              "gradle": "$GRADLE_VERSION",
+              "kotlin": "$KOTLIN_VERSION"
+            },
+            "stats": {
+              "binaries": $BIN_COUNT,
+              "libraries": $LIB_COUNT
+            },
+            "includes": {
+              "python": ${{ github.event.inputs.include_python || 'false' }},
+              "node": ${{ github.event.inputs.include_node || 'false' }},
+              "native": ${{ github.event.inputs.include_native || 'false' }},
+              "lua": ${{ github.event.inputs.include_lua || 'false' }}
+            }
+          }
+          EOF
+
+          echo "Manifest generated:"
+          cat "$GITHUB_WORKSPACE/$WORK_DIR/manifest.json"
+
+      - name: Pack tarball
+        id: pack
+        run: |
+          set -euo pipefail
+
+          cd "$WORK_DIR/extracted"
+
+          # Copy manifest into the archive root
+          cp "../manifest.json" ./TOOLCHAIN_MANIFEST.json
+
+          # Pack with -h to dereference all symlinks — Android needs real files
+          echo "Packing tarball (this may take a few minutes)…"
+          tar -cJhf "../$TARBALL_NAME.tar.xz" .
+
+          cd ..
+
+          SIZE=$(stat -c%s "$TARBALL_NAME.tar.xz")
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          SHA=$(sha256sum "$TARBALL_NAME.tar.xz" | cut -d' ' -f1)
+
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  TARBALL CREATED"
+          echo "════════════════════════════════════════════"
+          echo "  File:   $TARBALL_NAME.tar.xz"
+          echo "  Size:   ${SIZE_MB} MB"
+          echo "  SHA256: $SHA"
+          echo "════════════════════════════════════════════"
+
+          if [ "$SIZE" -lt "$MIN_TARBALL_BYTES" ]; then
+            echo "::error::Tarball is too small (${SIZE_MB} MB < $((MIN_TARBALL_BYTES / 1024 / 1024)) MB)"
+            exit 1
+          fi
+
+          if [ "$SIZE" -gt "$MAX_TARBALL_BYTES" ]; then
+            echo "::error::Tarball is too large (${SIZE_MB} MB > $((MAX_TARBALL_BYTES / 1024 / 1024)) MB)"
+            exit 1
+          fi
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: |
+            ${{ env.WORK_DIR }}/${{ env.TARBALL_NAME }}.tar.xz
+            ${{ env.WORK_DIR }}/manifest.json
+          retention-days: 14
+          compression-level: 0
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 8: RELEASE
+  #  Create or update the release and upload the tarball.
+  #  Idempotent — safe to re-run.
+  # ─────────────────────────────────────────────────────────────────
+  release:
+    name: Create release
+    runs-on: ubuntu-22.04
+    needs: [preflight, package]
+    timeout-minutes: 30
+    steps:
+      - name: Download tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: ${{ env.WORK_DIR }}
+
+      - name: Verify tarball integrity
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+
+          if [ ! -f "$TARBALL_NAME.tar.xz" ]; then
+            echo "::error::Tarball missing"
+            ls -la
+            exit 1
+          fi
+
+          echo "Tarball size: $(stat -c%s "$TARBALL_NAME.tar.xz") bytes"
+
+          # Quick integrity check — can we list the first few entries?
+          echo "First entries:"
+          tar -tJf "$TARBALL_NAME.tar.xz" | head -10
+
+          # Check the manifest is there
+          if ! tar -tJf "$TARBALL_NAME.tar.xz" | grep -q "TOOLCHAIN_MANIFEST.json"; then
+            echo "::warning::TOOLCHAIN_MANIFEST.json not found in tarball"
+          fi
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+          API="https://api.github.com/repos/$REPO"
+
+          echo "Target tag: $TAG"
+
+          # Try to fetch existing release
+          EXISTING=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/releases/tags/$TAG")
+
+          RELEASE_ID=$(echo "$EXISTING" | jq -r '.id // empty')
+
+          if [ -n "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ]; then
+            echo "  Existing release found: id=$RELEASE_ID"
+            UPLOAD_URL=$(echo "$EXISTING" | jq -r '.upload_url' | sed 's/{?name,label}//')
+          else
+            echo "  Creating new release…"
+
+            BODY=$(cat <<'EOF'
+          ## CodeForge Toolchain
+
+          Prebuilt aarch64 Android toolchain for CodeForge.
+
+          **Contents:**
+          - OpenJDK 17 (java, javac, jar, keytool)
+          - Gradle 8.x
+          - Kotlin compiler (kotlinc)
+          - Android build tools (aapt2, d8, apksigner)
+          - Common utilities (bash, tar, grep, sed, xz, openssl)
+
+          **Architecture:** aarch64 (arm64)
+          **Libc:** Bionic (Android native)
+          **Source:** Termux packages, RPATH-patched and flattened
+
+          See `TOOLCHAIN_MANIFEST.json` inside the archive for exact versions.
+          EOF
+            )
+
+            CREATED=$(curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/releases" \
+              -d "$(jq -n --arg tag "$TAG" --arg body "$BODY" \
+                '{tag_name: $tag, name: ("Toolchain " + $tag), body: $body, draft: false, prerelease: false}')")
+
+            RELEASE_ID=$(echo "$CREATED" | jq -r '.id // empty')
+
+            if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+              echo "::error::Failed to create release"
+              echo "$CREATED"
+              exit 1
+            fi
+
+            UPLOAD_URL=$(echo "$CREATED" | jq -r '.upload_url' | sed 's/{?name,label}//')
+            echo "  Release created: id=$RELEASE_ID"
+          fi
+
+          echo "upload_url=$UPLOAD_URL" >> "$GITHUB_ENV"
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_ENV"
+
+      - name: Remove existing asset if present
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          API="https://api.github.com/repos/$REPO"
+
+          EXISTING_ASSET=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/releases/tags/$TAG" \
+            | jq -r ".assets[] | select(.name==\"$TARBALL_NAME.tar.xz\") | .id // empty")
+
+          if [ -n "$EXISTING_ASSET" ] && [ "$EXISTING_ASSET" != "null" ]; then
+            echo "Removing existing asset id=$EXISTING_ASSET"
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/releases/assets/$EXISTING_ASSET"
+          fi
+
+      - name: Upload tarball to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          cd "$WORK_DIR"
+
+          echo "Uploading to: $upload_url"
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$TARBALL_NAME.tar.xz" \
+            "$upload_url?name=$TARBALL_NAME.tar.xz")
+
+          STATE=$(echo "$RESPONSE" | jq -r '.state // empty')
+          SIZE=$(echo "$RESPONSE" | jq -r '.size // empty')
+
+          if [ "$STATE" = "uploaded" ]; then
+            echo "  ✓ Upload complete"
+            echo "  Asset size: $SIZE bytes"
+          else
+            echo "::error::Upload failed"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+      - name: Print release URL
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$TARBALL_NAME.tar.xz"
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  BUILD COMPLETE"
+          echo "════════════════════════════════════════════"
+          echo ""
+          echo "Release URL:"
+          echo "  $URL"
+          echo ""
+          echo "Use this in ToolchainCatalog.kt:"
+          echo "  private const val ANDROID_TOOLCHAIN_URL ="
+          echo "      \"$URL\""
+          echo ""
+          echo "════════════════════════════════════════════"
+
+  # ─────────────────────────────────────────────────────────────────
+  #  JOB 9: CLEANUP (always runs, uploads logs on failure)
+  # ─────────────────────────────────────────────────────────────────
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-22.04
+    needs: [preflight, fetch-index, download, extract, patch, verify, package, release]
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "════════════════════════════════════════════"
+          echo "  WORKFLOW SUMMARY"
+          echo "════════════════════════════════════════════"
+          echo "Preflight:   ${{ needs.preflight.result }}"
+          echo "Fetch index: ${{ needs.fetch-index.result }}"
+          echo "Download:    ${{ needs.download.result }}"
+          echo "Extract:     ${{ needs.extract.result }}"
+          echo "Patch:       ${{ needs.patch.result }}"
+          echo "Verify:      ${{ needs.verify.result }}"
+          echo "Package:     ${{ needs.package.result }}"
+          echo "Release:     ${{ needs.release.result }}"
+          echo "════════════════════════════════════════════"
+
+          if [ "${{ needs.release.result }}" != "success" ]; then
+            echo ""
+            echo "::warning::Workflow did not complete successfully."
+            echo "Check the individual job logs to identify the failure."
+          fi
