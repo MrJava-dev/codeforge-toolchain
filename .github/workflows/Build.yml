@@ -58,7 +58,7 @@ env:
 
   TARBALL_NAME: toolchain-aarch64
   WORK_DIR: build
-  CACHE_VERSION: 'v1'
+  CACHE_VERSION: 'v2'
 
   MAX_RETRIES: '3'
   RETRY_DELAY_SECONDS: '5'
@@ -279,8 +279,11 @@ jobs:
             ' Packages | head -1
           }
 
+          # FIXED: use printf (no trailing newline) instead of echo.
+          # Also delete forbidden chars rather than replace with underscore
+          # except for ':' which we replace so version info is preserved.
           sanitize() {
-            echo "$1" | tr ':' '_' | tr '<>:"|?*' '_' | tr '\r\n' '__'
+            printf '%s' "$1" | tr ':' '_' | tr -d '<>:"|?*' | tr -d '\r\n'
           }
 
           download_from_mirrors() {
@@ -369,7 +372,16 @@ jobs:
           done
 
           echo ""
+          echo "Downloaded .deb files:"
           ls -lh "$DOWNLOAD_DIR" | tail -n +2
+
+          # Sanity check: any file NOT ending in .deb?
+          BAD=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f ! -name '*.deb' | head -5)
+          if [ -n "$BAD" ]; then
+            echo ""
+            echo "::warning::Files with unexpected extensions:"
+            echo "$BAD" | sed 's/^/  - /'
+          fi
 
       - name: Upload debs
         uses: actions/upload-artifact@v4
@@ -501,7 +513,6 @@ jobs:
           echo "Before flatten:"
           find . -maxdepth 4 -type d | head -20
 
-          # Recursively find the Termux prefix directory
           PREFIX_DIR=$(find . -type d -path '*com.termux/files/usr' 2>/dev/null | head -1)
 
           if [ -n "$PREFIX_DIR" ]; then
@@ -522,7 +533,6 @@ jobs:
             done
             shopt -u dotglob
 
-            # Clean up the leftover termux tree
             rm -rf data 2>/dev/null || true
             find . -type d -path '*com.termux*' -exec rm -rf {} + 2>/dev/null || true
             echo "  ✓ flattened"
@@ -627,7 +637,6 @@ jobs:
           set -uo pipefail
           cd "$WORK_DIR/extracted"
 
-          # bin/ → $ORIGIN/../lib
           PATCHED=0; FAILED=0
           while IFS= read -r -d '' file; do
             if file "$file" | grep -q "ELF"; then
@@ -637,7 +646,6 @@ jobs:
           done < <(find bin -type f -print0 2>/dev/null)
           echo "  bin/: $PATCHED ok, $FAILED fail"
 
-          # lib/*.so* → $ORIGIN
           PATCHED=0; FAILED=0
           while IFS= read -r -d '' file; do
             if file "$file" | grep -q "ELF"; then
@@ -647,7 +655,6 @@ jobs:
           done < <(find lib -type f -name '*.so*' -print0 2>/dev/null)
           echo "  lib/: $PATCHED ok, $FAILED fail"
 
-          # opt/ → $ORIGIN/../../lib
           if [ -d opt ]; then
             PATCHED=0; FAILED=0
             while IFS= read -r -d '' file; do
@@ -659,7 +666,6 @@ jobs:
             echo "  opt/: $PATCHED ok, $FAILED fail"
           fi
 
-          # lib/jvm JDK binaries → $ORIGIN/../../../lib
           if [ -d lib/jvm ]; then
             PATCHED=0; FAILED=0
             while IFS= read -r -d '' file; do
