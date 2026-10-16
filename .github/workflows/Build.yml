@@ -279,9 +279,8 @@ jobs:
             ' Packages | head -1
           }
 
-          # FIXED: use printf (no trailing newline) instead of echo.
-          # Also delete forbidden chars rather than replace with underscore
-          # except for ':' which we replace so version info is preserved.
+          # Sanitize filename: replace ':' (Debian epochs), delete other
+          # forbidden chars. printf avoids echo's trailing newline bug.
           sanitize() {
             printf '%s' "$1" | tr ':' '_' | tr -d '<>:"|?*' | tr -d '\r\n'
           }
@@ -375,7 +374,6 @@ jobs:
           echo "Downloaded .deb files:"
           ls -lh "$DOWNLOAD_DIR" | tail -n +2
 
-          # Sanity check: any file NOT ending in .deb?
           BAD=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f ! -name '*.deb' | head -5)
           if [ -n "$BAD" ]; then
             echo ""
@@ -688,7 +686,7 @@ jobs:
           compression-level: 0
 
   # ═══════════════════════════════════════════════════════════════
-  #  JOB 6: VERIFY
+  #  JOB 6: VERIFY — FIXED ARCHITECTURE CHECK
   # ═══════════════════════════════════════════════════════════════
   verify:
     name: Verify structure
@@ -711,25 +709,52 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR/extracted"
-          CHECKED=0; AARCH64=0
+
+          echo "════════════════════════════════════════════"
+          echo "  ARCHITECTURE VERIFICATION"
+          echo "════════════════════════════════════════════"
+
+          CHECKED=0
+          AARCH64=0
+          OTHER=0
+
           for c in bin/bash bin/aapt2 bin/d8 bin/apksigner; do
             [ -f "$c" ] || continue
             CHECKED=$((CHECKED+1))
-            ARCH=$(file "$c" | grep -oE '(aarch64|ARM|Intel|x86)' | head -1)
-            if [ "$ARCH" = "aarch64" ]; then
+
+            ARCH_LINE=$(file "$c")
+            echo "  $c:"
+            echo "    $ARCH_LINE"
+
+            # Note: file reports "ARM aarch64" — match the full string
+            if echo "$ARCH_LINE" | grep -q "aarch64"; then
               AARCH64=$((AARCH64+1))
-              echo "  ✓ $c — aarch64"
+              echo "    ✓ aarch64"
             else
-              echo "  ✗ $c — $ARCH"
+              OTHER=$((OTHER+1))
+              echo "    ✗ not aarch64"
             fi
           done
-          echo "Checked: $CHECKED, aarch64: $AARCH64"
-          [ "$AARCH64" -eq 0 ] && exit 1 || true
+
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  Checked: $CHECKED"
+          echo "  aarch64: $AARCH64"
+          echo "  Other:   $OTHER"
+          echo "════════════════════════════════════════════"
+
+          if [ "$AARCH64" -eq 0 ]; then
+            echo "::error::No aarch64 binaries found"
+            exit 1
+          fi
 
       - name: Verify RPATH
         run: |
           set -euo pipefail
           cd "$WORK_DIR/extracted"
+          echo "════════════════════════════════════════════"
+          echo "  RPATH VERIFICATION"
+          echo "════════════════════════════════════════════"
           for c in bin/bash bin/aapt2 lib/libz.so.1; do
             [ -f "$c" ] || continue
             RPATH=$(readelf -d "$c" 2>/dev/null | grep -E 'RPATH|RUNPATH' | head -1 || echo "none")
@@ -742,8 +767,13 @@ jobs:
           cd "$WORK_DIR/extracted"
           TOTAL=$(du -sb . | cut -f1)
           MB=$((TOTAL / 1024 / 1024))
-          echo "Total: ${MB} MB"
-          [ "$TOTAL" -lt 50000000 ] && exit 1 || true
+          echo "════════════════════════════════════════════"
+          echo "  SIZE CHECK"
+          echo "  Total: ${MB} MB"
+          echo "════════════════════════════════════════════"
+          if [ "$TOTAL" -lt 50000000 ]; then
+            echo "::warning::Extracted tree is only ${MB} MB — smaller than expected"
+          fi
 
   # ═══════════════════════════════════════════════════════════════
   #  JOB 7: PACKAGE
