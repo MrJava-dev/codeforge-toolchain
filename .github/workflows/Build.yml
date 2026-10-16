@@ -69,9 +69,9 @@ env:
 
 jobs:
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 1: PREFLIGHT
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   preflight:
     name: Preflight checks
     runs-on: ubuntu-22.04
@@ -91,7 +91,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $TAG"
 
-      - name: Check network to Termux mirrors
+      - name: Check network
         run: |
           set -uo pipefail
           index_ok=false
@@ -106,7 +106,7 @@ jobs:
             fi
           done
           if [ "$index_ok" = "false" ]; then
-            echo "::error::Termux index is not reachable from this runner."
+            echo "::error::Termux index not reachable"
             exit 1
           fi
 
@@ -124,15 +124,19 @@ jobs:
 
       - name: Report config
         run: |
+          echo "════════════════════════════════════════════"
+          echo "  BUILD CONFIGURATION"
+          echo "════════════════════════════════════════════"
           echo "Tag:            ${{ steps.tag.outputs.tag }}"
           echo "Include Python: ${{ github.event.inputs.include_python || 'false' }}"
           echo "Include Node:   ${{ github.event.inputs.include_node || 'false' }}"
           echo "Include Native: ${{ github.event.inputs.include_native || 'false' }}"
           echo "Include Lua:    ${{ github.event.inputs.include_lua || 'false' }}"
+          echo "════════════════════════════════════════════"
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 2: FETCH INDEX
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   fetch-index:
     name: Fetch Termux index
     runs-on: ubuntu-22.04
@@ -198,9 +202,9 @@ jobs:
           path: ${{ env.WORK_DIR }}/Packages
           retention-days: 7
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 3: DOWNLOAD PACKAGES
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   download:
     name: Download packages
     runs-on: ubuntu-22.04
@@ -210,7 +214,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download index artifact
+      - name: Download index
         uses: actions/download-artifact@v4
         with:
           name: termux-index
@@ -275,9 +279,6 @@ jobs:
             ' Packages | head -1
           }
 
-          # GitHub artifacts forbid: " : < > | * ? \r \n
-          # Debian epochs use ':' (e.g. ca-certificates_1:2026.09.25)
-          # so sanitize filenames before writing to disk.
           sanitize() {
             echo "$1" | tr ':' '_' | tr '<>:"|?*' '_' | tr '\r\n' '__'
           }
@@ -379,9 +380,9 @@ jobs:
             ${{ env.WORK_DIR }}/package-list.txt
           retention-days: 7
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 4: EXTRACT
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   extract:
     name: Extract and flatten
     runs-on: ubuntu-22.04
@@ -397,98 +398,201 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils
+          sudo apt-get install -y binutils zstd xz-utils
 
       - name: Extract every .deb
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
+
+          echo "════════════════════════════════════════════"
+          echo "  PRE-EXTRACT: directory structure"
+          echo "════════════════════════════════════════════"
+          echo "Working dir: $(pwd)"
+          find . -maxdepth 3 -type d | sort | head -30
+          echo ""
+          echo "All .deb files (recursive):"
+          find . -name '*.deb' -type f | head -40
+          echo ""
+
+          DEB_COUNT=$(find . -name '*.deb' -type f | wc -l)
+          echo "Total .deb files: $DEB_COUNT"
+          if [ "$DEB_COUNT" -eq 0 ]; then
+            echo "::error::No .deb files anywhere in $WORK_DIR"
+            echo "Full tree:"
+            find . -type f | head -40
+            exit 1
+          fi
+          echo "════════════════════════════════════════════"
+
           mkdir -p extracted
           EXTRACTED=0
           SKIPPED=0
+          NO_DATA=0
 
-          for deb in raw/*.deb; do
-            [ -e "$deb" ] || continue
-            echo "  → $(basename "$deb")"
+          while IFS= read -r -d '' deb; do
+            echo "  → $deb"
 
-            ar x "$deb" 2>/dev/null || { SKIPPED=$((SKIPPED+1)); continue; }
+            TMPD=$(mktemp -d)
+            ABS=$(realpath "$deb")
 
-            if [ -f data.tar.xz ]; then
-              tar -xf data.tar.xz -C extracted
-              rm -f data.tar.xz
-              EXTRACTED=$((EXTRACTED+1))
-            elif [ -f data.tar.gz ]; then
-              tar -xf data.tar.gz -C extracted
-              rm -f data.tar.gz
-              EXTRACTED=$((EXTRACTED+1))
-            else
-              echo "    ✗ no data.tar"
+            if ! (cd "$TMPD" && ar x "$ABS" 2>/dev/null); then
+              echo "    ✗ ar failed"
+              rm -rf "$TMPD"
               SKIPPED=$((SKIPPED+1))
+              continue
             fi
-            rm -f debian-binary control.tar.* 2>/dev/null || true
-          done
+
+            FOUND=""
+            for candidate in data.tar.xz data.tar.gz data.tar.zst data.tar.bz2 data.tar; do
+              if [ -f "$TMPD/$candidate" ]; then FOUND="$candidate"; break; fi
+            done
+
+            if [ -z "$FOUND" ]; then
+              echo "    ✗ no data.tar.* — contents:"
+              ls "$TMPD" | sed 's/^/       /'
+              NO_DATA=$((NO_DATA+1))
+              rm -rf "$TMPD"
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
+
+            case "$FOUND" in
+              "data.tar.xz")  tar -xf "$TMPD/data.tar.xz"  -C extracted ;;
+              "data.tar.gz")  tar -xf "$TMPD/data.tar.gz"  -C extracted ;;
+              "data.tar.bz2") tar -xf "$TMPD/data.tar.bz2" -C extracted ;;
+              "data.tar")     tar -xf "$TMPD/data.tar"     -C extracted ;;
+              "data.tar.zst")
+                if command -v zstd >/dev/null 2>&1; then
+                  zstd -d "$TMPD/data.tar.zst" -o "$TMPD/data.tar" -f
+                  tar -xf "$TMPD/data.tar" -C extracted
+                else
+                  echo "    ✗ zstd missing"
+                  rm -rf "$TMPD"
+                  SKIPPED=$((SKIPPED+1))
+                  continue
+                fi
+                ;;
+            esac
+
+            rm -rf "$TMPD"
+            EXTRACTED=$((EXTRACTED+1))
+          done < <(find . -name '*.deb' -type f -print0)
 
           echo ""
-          echo "Extracted: $EXTRACTED"
-          echo "Skipped:   $SKIPPED"
+          echo "════════════════════════════════════════════"
+          echo "  EXTRACT SUMMARY"
+          echo "    Extracted:   $EXTRACTED"
+          echo "    Skipped:     $SKIPPED"
+          echo "    No data.tar: $NO_DATA"
+          echo "════════════════════════════════════════════"
+
+          [ "$EXTRACTED" -eq 0 ] && { echo "::error::Nothing extracted"; exit 1; } || true
+
+          echo ""
+          echo "Top-level of extracted/:"
+          ls -la extracted/ | head -20
 
       - name: Flatten Termux prefix
         run: |
           set -euo pipefail
           cd "$WORK_DIR/extracted"
-          TERMUX_PREFIX="data/data/com.termux/files/usr"
 
-          if [ -d "$TERMUX_PREFIX" ]; then
-            echo "Flattening…"
+          echo "Before flatten:"
+          find . -maxdepth 4 -type d | head -20
+
+          # Recursively find the Termux prefix directory
+          PREFIX_DIR=$(find . -type d -path '*com.termux/files/usr' 2>/dev/null | head -1)
+
+          if [ -n "$PREFIX_DIR" ]; then
+            echo ""
+            echo "Found Termux prefix: $PREFIX_DIR"
             shopt -s dotglob
-            for item in "$TERMUX_PREFIX"/*; do
+            for item in "$PREFIX_DIR"/*; do
               base=$(basename "$item")
-              if [ -e "$base" ]; then
+              if [ -e "$base" ] && [ "$base" != "$item" ]; then
                 if [ -d "$item" ] && [ -d "$base" ]; then
                   cp -rn "$item"/* "$base/" 2>/dev/null || true
                 else
-                  mv "$item" .
+                  cp -rn "$item" . 2>/dev/null || true
                 fi
               else
                 mv "$item" .
               fi
             done
             shopt -u dotglob
-            rm -rf data
-            echo "  ✓ done"
+
+            # Clean up the leftover termux tree
+            rm -rf data 2>/dev/null || true
+            find . -type d -path '*com.termux*' -exec rm -rf {} + 2>/dev/null || true
+            echo "  ✓ flattened"
+          else
+            echo "No Termux prefix found — assuming already flat"
           fi
 
+          echo ""
+          echo "After flatten:"
           ls -la | head -20
 
       - name: Verify structure
         run: |
           set -euo pipefail
           cd "$WORK_DIR/extracted"
+
+          echo "════════════════════════════════════════════"
+          echo "  STRUCTURE VERIFICATION"
+          echo "════════════════════════════════════════════"
+
           FAIL=0
-          [ -d bin ] && echo "  ✓ bin/" || { echo "  ✗ bin/"; exit 1; }
 
-          if [ -d lib/jvm ] || [ -d opt/openjdk ]; then
-            echo "  ✓ JDK"
-          else
-            echo "  ✗ JDK"; FAIL=1
+          if [ ! -d bin ]; then
+            echo "::error::bin/ not found"
+            echo "Actual top-level:"
+            ls -la
+            exit 1
+          fi
+          echo "  ✓ bin/"
+
+          JDK_FOUND=0
+          for candidate in lib/jvm opt/openjdk lib/openjdk; do
+            if [ -e "$candidate" ]; then
+              echo "  ✓ JDK at $candidate"
+              JDK_FOUND=1
+              break
+            fi
+          done
+          [ "$JDK_FOUND" = "0" ] && { echo "  ✗ JDK not found"; FAIL=1; } || true
+
+          GRADLE_FOUND=0
+          for candidate in opt/gradle lib/gradle bin/gradle; do
+            if [ -e "$candidate" ]; then
+              echo "  ✓ Gradle at $candidate"
+              GRADLE_FOUND=1
+              break
+            fi
+          done
+          [ "$GRADLE_FOUND" = "0" ] && { echo "  ✗ Gradle not found"; FAIL=1; } || true
+
+          KOTLIN_FOUND=0
+          for candidate in opt/kotlin lib/kotlin bin/kotlinc; do
+            if [ -e "$candidate" ]; then
+              echo "  ✓ Kotlin at $candidate"
+              KOTLIN_FOUND=1
+              break
+            fi
+          done
+          [ "$KOTLIN_FOUND" = "0" ] && { echo "  ✗ Kotlin not found"; FAIL=1; } || true
+
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "Full tree (2 levels):"
+            find . -maxdepth 2 -type d | sort | head -40
+            exit 1
           fi
 
-          if [ -d opt/gradle ] || [ -f bin/gradle ]; then
-            echo "  ✓ Gradle"
-          else
-            echo "  ✗ Gradle"; FAIL=1
-          fi
-
-          if [ -d opt/kotlin ] || [ -f bin/kotlinc ]; then
-            echo "  ✓ Kotlin"
-          else
-            echo "  ✗ Kotlin"; FAIL=1
-          fi
-
-          [ "$FAIL" = "1" ] && exit 1
           echo ""
-          echo "Binaries: $(find bin -type f -executable | wc -l)"
-          echo "Libraries: $(find lib -name '*.so*' | wc -l)"
+          echo "  Binaries:  $(find bin -type f -executable 2>/dev/null | wc -l)"
+          echo "  Libraries: $(find lib -name '*.so*' 2>/dev/null | wc -l)"
 
       - name: Upload extracted tree
         uses: actions/upload-artifact@v4
@@ -498,9 +602,9 @@ jobs:
           retention-days: 3
           compression-level: 0
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 5: PATCH RPATH
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   patch:
     name: Patch RPATH
     runs-on: ubuntu-22.04
@@ -577,9 +681,9 @@ jobs:
           retention-days: 3
           compression-level: 0
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 6: VERIFY
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   verify:
     name: Verify structure
     runs-on: ubuntu-22.04
@@ -635,9 +739,9 @@ jobs:
           echo "Total: ${MB} MB"
           [ "$TOTAL" -lt 50000000 ] && exit 1 || true
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 7: PACKAGE
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   package:
     name: Package tarball
     runs-on: ubuntu-22.04
@@ -736,9 +840,9 @@ jobs:
           retention-days: 14
           compression-level: 0
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 8: RELEASE
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   release:
     name: Create release
     runs-on: ubuntu-22.04
@@ -858,9 +962,9 @@ jobs:
           echo "  $URL"
           echo "════════════════════════════════════════════"
 
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   #  JOB 9: CLEANUP
-  # ─────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════
   cleanup:
     name: Cleanup
     runs-on: ubuntu-22.04
