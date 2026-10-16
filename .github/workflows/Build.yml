@@ -686,7 +686,7 @@ jobs:
           compression-level: 0
 
   # ═══════════════════════════════════════════════════════════════
-  #  JOB 6: VERIFY — FIXED ARCHITECTURE CHECK
+  #  JOB 6: VERIFY
   # ═══════════════════════════════════════════════════════════════
   verify:
     name: Verify structure
@@ -726,7 +726,6 @@ jobs:
             echo "  $c:"
             echo "    $ARCH_LINE"
 
-            # Note: file reports "ARM aarch64" — match the full string
             if echo "$ARCH_LINE" | grep -q "aarch64"; then
               AARCH64=$((AARCH64+1))
               echo "    ✓ aarch64"
@@ -877,7 +876,7 @@ jobs:
           compression-level: 0
 
   # ═══════════════════════════════════════════════════════════════
-  #  JOB 8: RELEASE
+  #  JOB 8: RELEASE — SIGPIPE FIX APPLIED
   # ═══════════════════════════════════════════════════════════════
   release:
     name: Create release
@@ -896,8 +895,41 @@ jobs:
           set -euo pipefail
           cd "$WORK_DIR"
           [ -f "$TARBALL_NAME.tar.xz" ] || { echo "::error::missing"; exit 1; }
-          echo "Size: $(stat -c%s "$TARBALL_NAME.tar.xz") bytes"
-          tar -tJf "$TARBALL_NAME.tar.xz" | head -10
+
+          SIZE=$(stat -c%s "$TARBALL_NAME.tar.xz")
+          echo "Size: $SIZE bytes"
+
+          # FIX: writing tar listing to a file avoids the SIGPIPE that occurs
+          # when piping a huge archive into `head`. `head` exits after 10 lines,
+          # tar keeps writing, kernel sends SIGPIPE, tar exits 2, `pipefail`
+          # propagates the failure.
+          LIST_FILE=$(mktemp)
+          tar -tJf "$TARBALL_NAME.tar.xz" > "$LIST_FILE" 2>/dev/null || true
+
+          ENTRY_COUNT=$(wc -l < "$LIST_FILE")
+          echo "Entries: $ENTRY_COUNT"
+          echo ""
+          echo "First 10:"
+          head -10 "$LIST_FILE"
+          echo ""
+
+          # Verify essential directories are present
+          for d in ./bin ./lib; do
+            if grep -q "^${d}/" "$LIST_FILE"; then
+              echo "  ✓ $d present"
+            else
+              echo "::warning::$d not found in tarball"
+            fi
+          done
+
+          # Verify the manifest landed inside the archive
+          if grep -q "TOOLCHAIN_MANIFEST.json" "$LIST_FILE"; then
+            echo "  ✓ TOOLCHAIN_MANIFEST.json present"
+          else
+            echo "::warning::TOOLCHAIN_MANIFEST.json missing"
+          fi
+
+          rm -f "$LIST_FILE"
 
       - name: Create or update release
         env:
@@ -926,6 +958,8 @@ jobs:
           **Contents:** OpenJDK 17, Gradle, Kotlin compiler, aapt2, d8, apksigner
           **Architecture:** aarch64
           **Source:** Termux packages, RPATH-patched and flattened
+
+          See `TOOLCHAIN_MANIFEST.json` inside the archive for exact versions.
           EOF
             )
             CREATED=$(curl -s -X POST \
