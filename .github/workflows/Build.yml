@@ -190,7 +190,6 @@ jobs:
             return 1
           }
 
-          # ADDED libandroid-shmem HERE
           REQUIRED="openjdk-17 libandroid-shmem gradle kotlin aapt2 apksigner d8 bash coreutils findutils grep sed tar gzip xz-utils openssl ca-certificates zlib libandroid-support libiconv ncurses readline libexpat"
           OPTIONAL=""
           if [ "${{ github.event.inputs.include_python }}" = "true" ]; then OPTIONAL="$OPTIONAL python python-pip"; fi
@@ -288,6 +287,14 @@ jobs:
             rm -rf "$TMPD"
           done < <(find . -name '*.deb' -type f -print0)
 
+          echo "Extracted $EXTRACTED packages."
+
+          # ── CRITICAL CHECK: Make sure the folder actually exists ──
+          if [ ! -d "extracted" ]; then
+            echo "::error::The 'extracted' folder was not created. Extraction failed."
+            exit 1
+          fi
+
           PREFIX_DIR=$(find . -type d -path '*com.termux/files/usr' 2>/dev/null | head -1)
           if [ -n "$PREFIX_DIR" ]; then
             shopt -s dotglob
@@ -381,7 +388,6 @@ jobs:
       - name: Pack tarball
         run: |
           cd "$WORK_DIR/extracted"
-          # The -h flag dereferences symlinks, putting real files in the tarball
           tar -cJhf "../$TARBALL_NAME.tar.xz" .
       - name: Upload tarball
         uses: actions/upload-artifact@v4
